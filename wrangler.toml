@@ -1,0 +1,6 @@
+name = "command-code-api"
+main = "src/index.ts"
+compatibility_date = "2025-05-05"
+
+[vars]
+COMMAND_CODE_API_BASE = "https://api.commandcode.ai"
