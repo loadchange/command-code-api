@@ -1,0 +1,21 @@
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "daily"
+      time: "03:00"
+      timezone: "Asia/Singapore"
+    allow:
+      - dependency-name: "command-code"
+        dependency-type: "development"
+    versioning-strategy: "increase"
+    groups:
+      command-code:
+        patterns:
+          - "command-code"
+        update-types:
+          - "major"
+          - "minor"
+          - "patch"
+    open-pull-requests-limit: 1

@@ -2,12 +2,20 @@
   "name": "command-code-api",
   "version": "1.0.0",
   "private": true,
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test tests/contract.mjs tests/cli-oracle.mjs",
+    "check": "npm run typecheck && npm test && wrangler deploy --dry-run",
+    "update:command-code": "npm install command-code@latest --save-dev && npm run check"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250505.0",
+    "command-code": "^1.5.0",
     "typescript": "^5.8.0",
     "wrangler": "^4.0.0"
   }
