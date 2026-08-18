@@ -6,6 +6,9 @@
     "moduleResolution": "bundler",
     "resolveJsonModule": true,
     "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "verbatimModuleSyntax": true,
     "noEmit": true,
     "types": ["@cloudflare/workers-types"]
   },

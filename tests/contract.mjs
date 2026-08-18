@@ -1,3 +1,14 @@
+// End-to-end contract for the Worker.
+//
+// Every case runs the real Worker under `wrangler dev` against a loopback
+// stand-in for Command Code, so what is asserted is the bytes a client would
+// actually receive rather than the behaviour of a mocked internal function.
+//
+// The stand-in plays both Command Code routes. A key it does not recognise is
+// refused from the Provider API with `403 upgrade_required`, which is what the
+// cheap coding plans really get, so the CLI-route cases below exercise the
+// fallback exactly as a Go-plan account would.
+
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
@@ -6,6 +17,10 @@ import { createServer as createNetServer } from "node:net";
 import test from "node:test";
 
 const projectRoot = new URL("../", import.meta.url);
+
+const PROVIDER_KEY = "provider-plan-key";
+const PROVIDER_ERROR_KEY = "provider-broken-key";
+const PLAN_KEY = "coding-plan-key";
 
 async function freePort() {
   const server = createNetServer();
@@ -16,7 +31,7 @@ async function freePort() {
   return address.port;
 }
 
-async function readRequest(request) {
+async function readJson(request) {
   const chunks = [];
   for await (const chunk of request) chunks.push(chunk);
   return JSON.parse(Buffer.concat(chunks).toString("utf8"));
@@ -25,6 +40,11 @@ async function readRequest(request) {
 function writeEvents(response, events) {
   response.writeHead(200, { "content-type": "application/x-ndjson" });
   response.end(`${events.map((event) => JSON.stringify(event)).join("\n")}\n`);
+}
+
+function writeJson(response, status, body) {
+  response.writeHead(status, { "content-type": "application/json" });
+  response.end(JSON.stringify(body));
 }
 
 function deferred() {
@@ -56,7 +76,6 @@ function withTimeout(promise, timeoutMs, message) {
 function parseOpenAIStream(stream) {
   const chunks = [];
   let done = false;
-
   for (const line of stream.split("\n")) {
     if (!line.startsWith("data:")) continue;
     const data = line.slice("data:".length).trim();
@@ -66,52 +85,82 @@ function parseOpenAIStream(stream) {
     }
     chunks.push(JSON.parse(data));
   }
-
   return { chunks, done };
 }
 
-async function waitForWorker(url, process) {
-  let output = "";
-  process.stdout.on("data", (chunk) => { output += chunk; });
-  process.stderr.on("data", (chunk) => { output += chunk; });
+function parseAnthropicStream(stream) {
+  const events = [];
+  for (const frame of stream.split("\n\n")) {
+    const name = frame.match(/^event:\s*(.+)$/m)?.[1];
+    const data = frame.match(/^data:\s*(.+)$/m)?.[1];
+    if (!name || !data) continue;
+    events.push({ event: name, data: JSON.parse(data) });
+  }
+  return events;
+}
 
-  for (let attempt = 0; attempt < 100; attempt++) {
-    if (process.exitCode !== null) throw new Error(`wrangler exited early (${process.exitCode})\n${output}`);
+function openAIText(chunks) {
+  return chunks.map((chunk) => chunk.choices?.[0]?.delta?.content ?? "").join("");
+}
+
+function openAIToolCalls(chunks) {
+  const calls = new Map();
+  for (const chunk of chunks) {
+    for (const call of chunk.choices?.[0]?.delta?.tool_calls ?? []) {
+      const entry = calls.get(call.index) ?? { id: undefined, name: undefined, arguments: "" };
+      if (call.id) entry.id = call.id;
+      if (call.function?.name) entry.name = call.function.name;
+      entry.arguments += call.function?.arguments ?? "";
+      calls.set(call.index, entry);
+    }
+  }
+  return [...calls.entries()].sort(([a], [b]) => a - b).map(([, call]) => call);
+}
+
+async function waitForWorker(url, child) {
+  let output = "";
+  child.stdout.on("data", (chunk) => { output += chunk; });
+  child.stderr.on("data", (chunk) => { output += chunk; });
+
+  for (let attempt = 0; attempt < 200; attempt++) {
+    if (child.exitCode !== null) throw new Error(`wrangler exited early (${child.exitCode})\n${output}`);
     try {
       const response = await fetch(`${url}/health`);
       if (response.ok) return;
     } catch {}
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
-
   throw new Error(`wrangler did not become ready\n${output}`);
 }
 
-async function stopProcess(process) {
-  if (process.exitCode !== null) return;
-  process.kill("SIGTERM");
+async function stopProcess(child) {
+  if (child.exitCode !== null) return;
+  child.kill("SIGTERM");
   await Promise.race([
-    new Promise((resolve) => process.once("exit", resolve)),
+    new Promise((resolve) => child.once("exit", resolve)),
     new Promise((resolve) => setTimeout(resolve, 2_000)),
   ]);
-  if (process.exitCode === null) process.kill("SIGKILL");
+  if (child.exitCode === null) child.kill("SIGKILL");
 }
 
-test("command-code worker contract", async (t) => {
-  const captured = [];
+test("command-code worker contract", { timeout: 180_000 }, async (t) => {
+  const generateCalls = [];
+  const providerCalls = [];
   const pauseAttempts = new Map();
   const delayedPauseAttempts = new Map();
   const cancelUpstreamClosed = deferred();
   const abortUpstreamClosed = deferred();
   const heldResponses = new Set();
-  const modelsRequestHeaders = [];
-  let modelsResponseMode = "ok";
+  const modelsRequests = [];
+  let modelsMode = "ok";
   let delayedPauseCommitted = false;
   let delayedPauseContinuedBeforeCommit = false;
-  const commandCodePackageRoot = new URL("../node_modules/command-code/", import.meta.url);
-  const packageMetadata = JSON.parse(await readFile(new URL("package.json", commandCodePackageRoot), "utf8"));
-  const cliBundle = await readFile(new URL(packageMetadata.main, commandCodePackageRoot), "utf8");
-  const liveModelsPayload = {
+
+  const packageRoot = new URL("../node_modules/command-code/", import.meta.url);
+  const packageMetadata = JSON.parse(await readFile(new URL("package.json", packageRoot), "utf8"));
+  const cliBundle = await readFile(new URL(packageMetadata.main, packageRoot), "utf8");
+
+  const catalog = {
     object: "list",
     data: [
       {
@@ -123,17 +172,17 @@ test("command-code worker contract", async (t) => {
         context_length: 1_000_000,
       },
       {
-        id: "gpt-5.6-sol",
+        id: "claude-opus-5",
         object: "model",
         created: 1_785_367_072,
         owned_by: "command-code",
-        name: "GPT-5.6 Sol",
-        context_length: 1_050_000,
+        name: "Claude Opus 5",
+        context_length: 1_000_000,
       },
     ],
   };
 
-  const holdResponseOpen = (response, closed) => {
+  const holdOpen = (response, closed) => {
     heldResponses.add(response);
     response.once("close", () => {
       heldResponses.delete(response);
@@ -141,46 +190,76 @@ test("command-code worker contract", async (t) => {
     });
   };
 
+  const bearer = (request) => (request.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
+
   const upstream = createServer(async (request, response) => {
     try {
       if (request.method === "GET" && request.url === "/provider/v1/models") {
-        modelsRequestHeaders.push(request.headers);
-        if (modelsResponseMode === "error") {
-          response.writeHead(503, { "content-type": "application/json" });
-          response.end(JSON.stringify({ error: "catalog unavailable" }));
-          return;
-        }
-        if (modelsResponseMode === "empty") {
-          response.writeHead(200, { "content-type": "application/json" });
-          response.end(JSON.stringify({ object: "list", data: [] }));
-          return;
-        }
-        response.writeHead(200, { "content-type": "application/json" });
-        response.end(JSON.stringify(liveModelsPayload));
-        return;
+        modelsRequests.push(request.headers);
+        if (modelsMode === "error") return writeJson(response, 503, { error: "catalog unavailable" });
+        if (modelsMode === "empty") return writeJson(response, 200, { object: "list", data: [] });
+        return writeJson(response, 200, catalog);
       }
 
-      const body = await readRequest(request);
-      captured.push({ headers: request.headers, body });
+      if (request.url === "/provider/v1/chat/completions" || request.url === "/provider/v1/messages") {
+        const body = await readJson(request);
+        const key = bearer(request);
+        providerCalls.push({ url: request.url, headers: request.headers, body, key });
 
+        if (key === PROVIDER_ERROR_KEY) {
+          return writeJson(response, 400, {
+            error: { type: "invalid_request_error", message: "provider api said no", code: "bad_request" },
+          });
+        }
+        if (key !== PROVIDER_KEY) {
+          // What a coding plan without API access really gets.
+          return writeJson(response, 403, {
+            error: {
+              type: "permission_error",
+              code: "upgrade_required",
+              message: "Your Go plan doesn't include API access.",
+            },
+          });
+        }
+        return writeJson(response, 200, {
+          native: true,
+          route: request.url,
+          model: body.model,
+          stream: body.stream === true,
+        });
+      }
+
+      if (request.url !== "/alpha/generate") {
+        return writeJson(response, 404, { error: { message: `unexpected route ${request.url}` } });
+      }
+
+      const body = await readJson(request);
+      generateCalls.push({ headers: request.headers, body });
+      const model = body.params.model;
       const lastMessage = body.params.messages.at(-1);
-      if (body.params.model === "fixture/cancel-open") {
-        holdResponseOpen(response, cancelUpstreamClosed);
+
+      if (model === "fixture/cancel-open") {
+        holdOpen(response, cancelUpstreamClosed);
         response.writeHead(200, { "content-type": "application/x-ndjson" });
         response.write(`${JSON.stringify({ type: "text-delta", text: "cancel me" })}\n`);
-      } else if (body.params.model === "fixture/abort-open") {
-        holdResponseOpen(response, abortUpstreamClosed);
+      } else if (model === "fixture/abort-open") {
+        holdOpen(response, abortUpstreamClosed);
         response.writeHead(200, { "content-type": "application/x-ndjson" });
         response.write(`${JSON.stringify({ type: "text-delta", text: "before open abort" })}\n`);
         response.write(`${JSON.stringify({ type: "abort" })}\n`);
-      } else if (body.params.model === "fixture/finish-step-boundary") {
+      } else if (model === "fixture/finish-step-boundary") {
         writeEvents(response, [
           { type: "text-delta", text: "step-one" },
           { type: "finish-step", finishReason: "stop", usage: { inputTokens: 1, outputTokens: 1 } },
           { type: "text-delta", text: "-step-two" },
           { type: "finish", finishReason: "stop", totalUsage: { inputTokens: 3, outputTokens: 2 } },
         ]);
-      } else if (body.params.model === "fixture/pause-after-commit") {
+      } else if (model === "fixture/finish-step-only") {
+        writeEvents(response, [
+          { type: "text-delta", text: "legacy" },
+          { type: "finish-step", finishReason: "stop", usage: { inputTokens: 2, outputTokens: 1 } },
+        ]);
+      } else if (model === "fixture/pause-after-commit") {
         const attempt = (delayedPauseAttempts.get(body.threadId) ?? 0) + 1;
         delayedPauseAttempts.set(body.threadId, attempt);
         if (attempt === 1) {
@@ -205,45 +284,90 @@ test("command-code worker contract", async (t) => {
             { type: "finish", finishReason: "stop", totalUsage: { inputTokens: 3, outputTokens: 2 } },
           ]);
         }
-      } else if (body.params.model === "fixture/pause-turn") {
+      } else if (model === "fixture/pause-turn") {
         const attempt = (pauseAttempts.get(body.threadId) ?? 0) + 1;
         pauseAttempts.set(body.threadId, attempt);
-        if (attempt === 1) {
-          writeEvents(response, [
-            { type: "text-delta", text: "first " },
-            {
-              type: "finish",
-              rawFinishReason: "pause_turn",
-              totalUsage: {
-                inputTokens: 2,
-                outputTokens: 1,
-                inputTokenDetails: { cacheReadTokens: 1, cacheWriteTokens: 2 },
-              },
-            },
-          ]);
-        } else {
-          writeEvents(response, [
-            { type: "text-delta", text: "second" },
-            {
-              type: "finish",
-              finishReason: "stop",
-              totalUsage: {
-                inputTokens: 3,
-                outputTokens: 4,
-                inputTokenDetails: { cacheReadTokens: 2, cacheWriteTokens: 3 },
-              },
-            },
-          ]);
-        }
-      } else if (body.params.model === "fixture/tool-coercion") {
+        writeEvents(
+          response,
+          attempt === 1
+            ? [
+                { type: "text-delta", text: "first " },
+                {
+                  type: "finish",
+                  rawFinishReason: "pause_turn",
+                  totalUsage: {
+                    inputTokens: 2,
+                    outputTokens: 1,
+                    inputTokenDetails: { cacheReadTokens: 1, cacheWriteTokens: 2 },
+                  },
+                },
+              ]
+            : [
+                { type: "text-delta", text: "second" },
+                {
+                  type: "finish",
+                  finishReason: "stop",
+                  totalUsage: {
+                    inputTokens: 3,
+                    outputTokens: 4,
+                    inputTokenDetails: { cacheReadTokens: 2, cacheWriteTokens: 3 },
+                  },
+                },
+              ],
+        );
+      } else if (model === "fixture/tool-coercion") {
         writeEvents(response, [
           { type: "tool-call", toolCallId: "call_null", toolName: "null_tool", input: null },
           { type: "tool-call", toolCallId: "call_array", toolName: "array_tool", input: [{ value: "array" }] },
           { type: "tool-call", toolCallId: "call_json", toolName: "json_tool", input: '{"value":"json"}' },
           { type: "tool-call", toolCallId: "call_bare", toolName: "bare_tool", input: "bare" },
+          { type: "tool-call", toolCallId: "call_list", toolName: "list_tool", input: "listed" },
           { type: "finish", finishReason: "tool-calls", totalUsage: { inputTokens: 5, outputTokens: 4 } },
         ]);
-      } else if (body.params.model === "fixture/provider-tools-active") {
+      } else if (model === "fixture/streamed-tools") {
+        // Two calls whose incremental events interleave, then the redundant
+        // trailing `tool-call` the gateway repeats for each of them.
+        writeEvents(response, [
+          { type: "tool-input-start", id: "call_a", toolName: "search" },
+          { type: "tool-input-start", id: "call_b", toolName: "search" },
+          { type: "tool-input-delta", id: "call_a", delta: '{"query":' },
+          { type: "tool-input-delta", id: "call_b", delta: '{"query":"two"}' },
+          { type: "tool-input-delta", id: "call_a", delta: '"one"}' },
+          { type: "tool-input-end", id: "call_b" },
+          { type: "tool-input-end", id: "call_a" },
+          { type: "tool-call", toolCallId: "call_a", toolName: "search", input: { query: "one" } },
+          { type: "tool-call", toolCallId: "call_b", toolName: "search", input: { query: "two" } },
+          { type: "finish", finishReason: "tool-calls", totalUsage: { inputTokens: 6, outputTokens: 5 } },
+        ]);
+      } else if (model === "fixture/interleaved-blocks") {
+        writeEvents(response, [
+          { type: "reasoning-start", id: "r1" },
+          { type: "reasoning-delta", id: "r1", text: "thinking" },
+          { type: "text-start", id: "t1" },
+          { type: "text-delta", id: "t1", text: "answer" },
+          { type: "reasoning-end", id: "r1" },
+          { type: "text-end", id: "t1" },
+          { type: "finish", finishReason: "stop", totalUsage: { inputTokens: 2, outputTokens: 2 } },
+        ]);
+      } else if (model === "fixture/provider-tools") {
+        writeEvents(response, [
+          {
+            type: "tool-call",
+            toolCallId: "call_provider",
+            toolName: "web_search",
+            input: { query: "weather" },
+            providerExecuted: true,
+          },
+          {
+            type: "tool-result",
+            toolCallId: "call_provider",
+            toolName: "web_search",
+            output: { type: "text", value: "sunny" },
+          },
+          { type: "text-delta", text: "provider tool complete" },
+          { type: "finish", finishReason: "tool-calls", totalUsage: { inputTokens: 4, outputTokens: 3 } },
+        ]);
+      } else if (model === "fixture/provider-tools-active") {
         response.writeHead(200, { "content-type": "application/x-ndjson" });
         response.write(`${JSON.stringify({
           type: "tool-call",
@@ -264,36 +388,12 @@ test("command-code worker contract", async (t) => {
           { type: "text-delta", text: "provider activity preserved" },
           { type: "finish", finishReason: "stop", totalUsage: { inputTokens: 4, outputTokens: 3 } },
         ].map((event) => JSON.stringify(event)).join("\n")}\n`);
-      } else if (body.params.model === "fixture/provider-tools") {
-        writeEvents(response, [
-          {
-            type: "tool-call",
-            toolCallId: "call_provider",
-            toolName: "web_search",
-            input: { query: "weather" },
-            providerExecuted: true,
-          },
-          {
-            type: "tool-result",
-            toolCallId: "call_provider",
-            toolName: "web_search",
-            output: { type: "text", value: "sunny" },
-          },
-          { type: "text-delta", text: "provider tool complete" },
-          { type: "finish", finishReason: "stop", totalUsage: { inputTokens: 4, outputTokens: 3 } },
-        ]);
-      } else if (body.params.model === "fixture/same-name-tools") {
-        writeEvents(response, [
-          { type: "tool-call", toolCallId: "call_search_one", toolName: "search", input: { query: "one" } },
-          { type: "tool-call", toolCallId: "call_search_two", toolName: "search", input: { query: "two" } },
-          { type: "finish", finishReason: "tool-calls", totalUsage: { inputTokens: 4, outputTokens: 2 } },
-        ]);
-      } else if (body.params.model === "fixture/abort") {
+      } else if (model === "fixture/abort") {
         writeEvents(response, [
           { type: "text-delta", text: "before abort" },
           { type: "abort" },
         ]);
-      } else if (body.params.model === "fixture/cache-usage") {
+      } else if (model === "fixture/cache-usage") {
         writeEvents(response, [
           { type: "text-delta", text: "cached" },
           {
@@ -306,15 +406,23 @@ test("command-code worker contract", async (t) => {
             },
           },
         ]);
-      } else if (body.params.model === "fixture/rate-limit") {
-        writeEvents(response, [{
-          type: "error",
-          error: { message: "slow down", statusCode: 429, isRetryable: true },
-        }]);
-      } else if (body.params.model === "stream-error") {
+      } else if (model === "fixture/rate-limit") {
+        writeEvents(response, [
+          { type: "error", error: { message: "slow down", statusCode: 429, isRetryable: true } },
+        ]);
+      } else if (model === "fixture/embedded-error") {
+        writeEvents(response, [
+          { type: "error", error: { message: '429 {"error":{"type":"rate_limit","message":"upstream is busy"}}' } },
+        ]);
+      } else if (model === "fixture/stream-error") {
         writeEvents(response, [{ type: "error", error: { message: "fixture failure" } }]);
-      } else if (body.params.model === "truncated") {
+      } else if (model === "fixture/truncated") {
         writeEvents(response, [{ type: "text-delta", text: "partial" }]);
+      } else if (model === "fixture/echo") {
+        writeEvents(response, [
+          { type: "text-delta", text: "echo" },
+          { type: "finish", finishReason: "stop", totalUsage: { inputTokens: 1, outputTokens: 1 } },
+        ]);
       } else if (lastMessage?.role === "tool") {
         writeEvents(response, [
           { type: "text-delta", text: "tool result received" },
@@ -358,6 +466,8 @@ test("command-code worker contract", async (t) => {
       `COMMAND_CODE_API_BASE:http://127.0.0.1:${upstreamAddress.port}`,
       "--var",
       "COMMAND_CODE_STREAM_IDLE_TIMEOUT_MS:1000",
+      "--var",
+      "COMMAND_CODE_ROUTE:auto",
     ],
     { cwd: projectRoot, stdio: ["ignore", "pipe", "pipe"] },
   );
@@ -371,22 +481,59 @@ test("command-code worker contract", async (t) => {
 
   await waitForWorker(workerUrl, wrangler);
 
+  const openai = (body, { key = PLAN_KEY, headers = {} } = {}) =>
+    fetch(`${workerUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${key}`, ...headers },
+      body: JSON.stringify(body),
+    });
+
+  const anthropic = (body, { key = PLAN_KEY, headers = {} } = {}) =>
+    fetch(`${workerUrl}/v1/messages`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": key,
+        "anthropic-version": "2023-06-01",
+        ...headers,
+      },
+      body: JSON.stringify(body),
+    });
+
+  // ── the wire contract this adapter was derived from ──────────────
+
   await t.test("installed CLI still contains the adapted wire contract", () => {
     for (const marker of [
       "/alpha/generate",
       "x-command-code-version",
+      "x-session-id",
+      "permissionMode",
       "reasoning_effort",
-      "text-delta",
-      "reasoning-delta",
+      "input_schema",
       "tool-call",
       "tool-result",
+      "text-delta",
+      "reasoning-delta",
       "totalUsage",
+      "inputTokenDetails",
+      "pause_turn",
       "finish",
       "abort",
     ]) {
       assert(cliBundle.includes(marker), `command-code wire marker disappeared: ${marker}`);
     }
   });
+
+  await t.test("health reports the client version and the configured route", async () => {
+    const response = await fetch(`${workerUrl}/health`);
+    assert.equal(response.status, 200);
+    const payload = await response.json();
+    assert.equal(payload.status, "ok");
+    assert.equal(payload.command_code_version, packageMetadata.version);
+    assert.equal(payload.route, "auto");
+  });
+
+  // ── model discovery ──────────────────────────────────────────────
 
   await t.test("proxies the official live model catalog without credentials", async () => {
     for (const path of ["/v1/models", "/models"]) {
@@ -395,66 +542,343 @@ test("command-code worker contract", async (t) => {
       });
       assert.equal(response.status, 200);
       assert.equal(response.headers.get("cache-control"), "no-store");
-      assert.deepEqual(await response.json(), liveModelsPayload);
+      assert.deepEqual(await response.json(), catalog);
     }
-    assert.equal(modelsRequestHeaders.length, 2);
-    assert(modelsRequestHeaders.every((headers) => headers.authorization === undefined));
+    assert.equal(modelsRequests.length, 2);
+    assert(modelsRequests.every((headers) => headers.authorization === undefined));
   });
 
   await t.test("fails honestly when the live model catalog is unavailable or invalid", async () => {
     for (const mode of ["error", "empty"]) {
-      modelsResponseMode = mode;
+      modelsMode = mode;
       const response = await fetch(`${workerUrl}/v1/models`);
       assert.equal(response.status, 502);
-      const payload = await response.json();
-      assert.equal(payload.error.type, "api_error");
       assert.equal(response.headers.get("cache-control"), "no-store");
+      assert.equal((await response.json()).error.type, "api_error");
     }
-    modelsResponseMode = "ok";
+    modelsMode = "ok";
   });
 
-  await t.test("uses the installed protocol version and latest structured request", async () => {
-    const response = await fetch(`${workerUrl}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer test-key" },
-      body: JSON.stringify({
-        model: liveModelsPayload.data[0].id,
-        messages: [{ role: "system", content: "Be concise" }, { role: "user", content: "Hi" }],
-      }),
+  // ── route selection ──────────────────────────────────────────────
+
+  await t.test("serves an entitled key from the documented Provider API untranslated", async () => {
+    const generateBefore = generateCalls.length;
+
+    const completion = await openai(
+      { model: "claude-opus-5", messages: [{ role: "user", content: "Hi" }] },
+      { key: PROVIDER_KEY },
+    );
+    assert.equal(completion.status, 200);
+    assert.deepEqual(await completion.json(), {
+      native: true,
+      route: "/provider/v1/chat/completions",
+      model: "claude-opus-5",
+      stream: false,
+    });
+
+    const message = await anthropic(
+      { model: "claude-opus-5", max_tokens: 16, messages: [{ role: "user", content: "Hi" }] },
+      { key: PROVIDER_KEY },
+    );
+    assert.equal(message.status, 200);
+    assert.equal((await message.json()).route, "/provider/v1/messages");
+
+    const forwarded = providerCalls.filter((call) => call.key === PROVIDER_KEY);
+    assert.equal(forwarded.length, 2);
+    assert.equal(forwarded[1].headers["anthropic-version"], "2023-06-01");
+    // Forwarded, not rebuilt: the Provider API speaks both protocols natively.
+    assert.deepEqual(forwarded[0].body.messages, [{ role: "user", content: "Hi" }]);
+    assert.equal(generateCalls.length, generateBefore, "an entitled key must not reach the CLI route");
+  });
+
+  await t.test("relays a Provider API refusal that is not about the plan", async () => {
+    const response = await openai(
+      { model: "claude-opus-5", messages: [{ role: "user", content: "Hi" }] },
+      { key: PROVIDER_ERROR_KEY },
+    );
+    assert.equal(response.status, 400);
+    const payload = await response.json();
+    assert.equal(payload.error.code, "bad_request");
+    assert.equal(payload.error.message, "provider api said no");
+    assert.equal(
+      generateCalls.filter((call) => call.headers.authorization === `Bearer ${PROVIDER_ERROR_KEY}`).length,
+      0,
+      "a non-entitlement refusal must not silently spend the coding plan instead",
+    );
+  });
+
+  // ── the CLI route: request shape ─────────────────────────────────
+
+  await t.test("falls back to the CLI route when the plan has no API access", async () => {
+    const response = await openai({
+      model: catalog.data[0].id,
+      messages: [{ role: "system", content: "Be concise" }, { role: "user", content: "Hi" }],
     });
     assert.equal(response.status, 200);
+
     const payload = await response.json();
     assert.equal(payload.choices[0].message.content, "hello");
     assert.equal(payload.choices[0].message.reasoning_content, "think");
     assert.equal(payload.choices[0].finish_reason, "stop");
     assert.deepEqual(payload.usage, { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 });
 
-    const request = captured.at(-1);
-    assert.equal(request.headers["x-command-code-version"], packageMetadata.version);
-    assert.equal(request.headers["x-cli-environment"], "production");
-    assert.equal(request.headers["user-agent"], "cli");
-    assert.equal(request.headers["x-taste-learning"], "true");
-    assert.equal(request.headers["x-co-flag"], "false");
-    assert.equal(request.body.memory, null);
-    assert.equal(request.body.taste, null);
-    assert.equal(request.body.skills, null);
-    assert.equal(request.body.params.model, liveModelsPayload.data[0].id);
-    assert.equal(request.body.params.max_tokens, 64_000);
-    assert.equal("temperature" in request.body.params, false);
-    assert.deepEqual(request.body.params.messages, [{ role: "user", content: [{ type: "text", text: "Hi" }] }]);
+    const { headers, body } = generateCalls.at(-1);
+    assert.equal(headers["x-command-code-version"], packageMetadata.version);
+    assert.equal(headers["x-cli-environment"], "production");
+    assert.equal(headers["user-agent"], "cli");
+    assert.equal(headers["x-taste-learning"], "true");
+    assert.equal(headers["x-co-flag"], "false");
+    assert.equal(headers["x-session-id"], body.threadId);
+    assert.equal(headers["x-cmd-zdr"], undefined);
+
+    // The envelope is schema-strict; a missing field is a 400 naming its path.
+    assert.deepEqual(Object.keys(body).sort(), [
+      "config",
+      "memory",
+      "params",
+      "permissionMode",
+      "skills",
+      "taste",
+      "threadId",
+    ]);
+    assert.equal(body.memory, null);
+    assert.equal(body.taste, null);
+    assert.equal(body.skills, null);
+    assert.equal(body.permissionMode, "standard");
+    assert.deepEqual(Object.keys(body.config).sort(), [
+      "currentBranch",
+      "date",
+      "environment",
+      "gitStatus",
+      "isGitRepo",
+      "mainBranch",
+      "recentCommits",
+      "structure",
+      "workingDir",
+    ]);
+    assert.equal(body.params.model, catalog.data[0].id);
+    assert.equal(body.params.system, "Be concise");
+    assert.equal(body.params.max_tokens, 64_000);
+    assert.equal(body.params.stream, true);
+    assert.equal("temperature" in body.params, false);
+    assert.deepEqual(body.params.messages, [{ role: "user", content: [{ type: "text", text: "Hi" }] }]);
   });
 
-  await t.test("continues pause_turn with the same thread and aggregates text and usage", async () => {
-    const capturedBefore = captured.length;
-    const response = await fetch(`${workerUrl}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer test-key" },
-      body: JSON.stringify({
-        model: "fixture/pause-turn",
-        messages: [{ role: "user", content: "Continue until done" }],
-      }),
+  await t.test("remembers the refusal instead of buying it once per turn", async () => {
+    const providerBefore = providerCalls.filter((call) => call.key === PLAN_KEY).length;
+    const response = await openai({ model: "fixture/echo", messages: [{ role: "user", content: "again" }] });
+    assert.equal(response.status, 200);
+    assert.equal(
+      providerCalls.filter((call) => call.key === PLAN_KEY).length,
+      providerBefore,
+      "a key already known to be refused must go straight to the CLI route",
+    );
+  });
+
+  await t.test("sends a neutral system prompt rather than inheriting the agent's", async () => {
+    await openai({ model: "fixture/echo", messages: [{ role: "user", content: "no system prompt" }] });
+    // An empty system field is a cue for the gateway to splice in Command
+    // Code's own multi-thousand-token agent preamble, billed to the caller.
+    assert.equal(generateCalls.at(-1).body.params.system, "You are a helpful assistant.");
+
+    await anthropic({
+      model: "fixture/echo",
+      max_tokens: 16,
+      system: [{ type: "text", text: "First" }, { type: "text", text: "Second" }],
+      messages: [{ role: "user", content: "hi" }],
+    });
+    assert.equal(generateCalls.at(-1).body.params.system, "First\n\nSecond");
+  });
+
+  await t.test("carries the caller's parameters onto the wire", async () => {
+    await openai({
+      model: "fixture/echo",
+      messages: [{ role: "user", content: "hi" }],
+      max_completion_tokens: 128,
+      temperature: 0.25,
+      reasoning_effort: "High",
+    });
+    const { params } = generateCalls.at(-1).body;
+    assert.equal(params.max_tokens, 128);
+    assert.equal(params.temperature, 0.25);
+    assert.equal(params.reasoning_effort, "high");
+  });
+
+  await t.test("forwards Anthropic output_config.effort", async () => {
+    await anthropic({
+      model: "fixture/echo",
+      max_tokens: 32,
+      messages: [{ role: "user", content: "hi" }],
+      output_config: { effort: "xhigh" },
+    });
+    assert.equal(generateCalls.at(-1).body.params.reasoning_effort, "xhigh");
+  });
+
+  await t.test("rejects an unusable reasoning effort before spending a turn", async () => {
+    const before = generateCalls.length;
+    const response = await openai({
+      model: "fixture/echo",
+      messages: [{ role: "user", content: "hi" }],
+      reasoning_effort: "turbo",
+    });
+    assert.equal(response.status, 400);
+    const payload = await response.json();
+    assert.equal(payload.error.type, "invalid_request_error");
+    assert.match(payload.error.message, /low, medium, high, xhigh, max/);
+    assert.equal(generateCalls.length, before);
+  });
+
+  await t.test("translates OpenAI tool history into the ModelMessage schema", async () => {
+    await openai({
+      model: "fixture/echo",
+      messages: [
+        { role: "user", content: "weather?" },
+        {
+          role: "assistant",
+          content: "checking",
+          tool_calls: [
+            { id: "call_1", type: "function", function: { name: "get_weather", arguments: '{"city":"Paris"}' } },
+            { id: "call_2", type: "function", function: { name: "get_time", arguments: "not json" } },
+          ],
+        },
+        { role: "tool", tool_call_id: "call_1", content: "18C" },
+        { role: "tool", tool_call_id: "call_2", content: "noon" },
+      ],
+      tools: [
+        { type: "function", function: { name: "get_weather", description: "w", parameters: { type: "object" } } },
+      ],
+    });
+
+    const { params } = generateCalls.at(-1).body;
+    assert.deepEqual(params.tools, [
+      { name: "get_weather", description: "w", input_schema: { type: "object" } },
+    ]);
+    assert.deepEqual(params.messages[1], {
+      role: "assistant",
+      content: [
+        { type: "text", text: "checking" },
+        { type: "tool-call", toolCallId: "call_1", toolName: "get_weather", input: { city: "Paris" } },
+        // Unparseable arguments still have to reach the wire as an object.
+        { type: "tool-call", toolCallId: "call_2", toolName: "get_time", input: { value: "not json" } },
+      ],
+    });
+    // Consecutive results are one tool message; two would read to the model as
+    // two separate turns. Each result names the tool its call named.
+    assert.equal(params.messages.length, 3);
+    assert.deepEqual(params.messages[2], {
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId: "call_1",
+          toolName: "get_weather",
+          output: { type: "text", value: "18C" },
+        },
+        {
+          type: "tool-result",
+          toolCallId: "call_2",
+          toolName: "get_time",
+          output: { type: "text", value: "noon" },
+        },
+      ],
+    });
+  });
+
+  await t.test("splits an Anthropic tool-result turn into a tool message and a user message", async () => {
+    await anthropic({
+      model: "fixture/echo",
+      max_tokens: 64,
+      messages: [
+        { role: "user", content: "weather?" },
+        {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "let me check", signature: "sig" },
+            { type: "tool_use", id: "toolu_1", name: "get_weather", input: { city: "Paris" } },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "toolu_1", content: [{ type: "text", text: "18C" }] },
+            { type: "tool_result", tool_use_id: "toolu_missing", content: "unmatched", is_error: true },
+            { type: "text", text: "and tomorrow?" },
+          ],
+        },
+      ],
+    });
+
+    const { messages } = generateCalls.at(-1).body.params;
+    assert.deepEqual(messages[1], {
+      role: "assistant",
+      content: [
+        { type: "reasoning", text: "let me check" },
+        { type: "tool-call", toolCallId: "toolu_1", toolName: "get_weather", input: { city: "Paris" } },
+      ],
+    });
+    assert.equal(messages[2].role, "tool");
+    assert.deepEqual(messages[2].content[0].output, { type: "text", value: "18C" });
+    assert.equal(messages[2].content[0].toolName, "get_weather");
+    // A result with no matching call still has to name something, and a failed
+    // tool run must not read as if it had succeeded with that text.
+    assert.equal(messages[2].content[1].toolName, "unknown");
+    assert.deepEqual(messages[2].content[1].output, { type: "error-text", value: "unmatched" });
+    assert.deepEqual(messages[3], { role: "user", content: [{ type: "text", text: "and tomorrow?" }] });
+  });
+
+  await t.test("carries images with the media type the wire schema wants", async () => {
+    await openai({
+      model: "fixture/echo",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "what is this" },
+            { type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } },
+            { type: "image_url", image_url: "https://example.test/photo.JPG" },
+          ],
+        },
+      ],
+    });
+    assert.deepEqual(generateCalls.at(-1).body.params.messages[0].content, [
+      { type: "text", text: "what is this" },
+      { type: "image", image: "data:image/png;base64,AAAA", mimeType: "image/png" },
+      { type: "image", image: "https://example.test/photo.JPG", mimeType: "image/jpeg" },
+    ]);
+
+    await anthropic({
+      model: "fixture/echo",
+      max_tokens: 16,
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "image", source: { type: "base64", media_type: "image/webp", data: "BBBB" } }],
+        },
+      ],
+    });
+    assert.deepEqual(generateCalls.at(-1).body.params.messages[0].content, [
+      { type: "image", image: "data:image/webp;base64,BBBB", mimeType: "image/webp" },
+    ]);
+  });
+
+  await t.test("honours a zero-data-retention request", async () => {
+    await openai(
+      { model: "fixture/echo", messages: [{ role: "user", content: "private" }] },
+      { headers: { "x-cmd-zdr": "1" } },
+    );
+    assert.equal(generateCalls.at(-1).headers["x-cmd-zdr"], "1");
+  });
+
+  // ── the CLI route: continuations and boundaries ──────────────────
+
+  await t.test("continues pause_turn on the same thread and aggregates text and usage", async () => {
+    const before = generateCalls.length;
+    const response = await openai({
+      model: "fixture/pause-turn",
+      messages: [{ role: "user", content: "Continue until done" }],
     });
     assert.equal(response.status, 200);
+
     const payload = await response.json();
     assert.equal(payload.choices[0].message.content, "first second");
     assert.equal(payload.choices[0].finish_reason, "stop");
@@ -465,506 +889,466 @@ test("command-code worker contract", async (t) => {
       prompt_tokens_details: { cached_tokens: 3 },
     });
 
-    const continuationRequests = captured.slice(capturedBefore);
-    assert.equal(continuationRequests.length, 2);
-    assert.match(continuationRequests[0].body.threadId, /^[0-9a-f-]{36}$/i);
-    assert.equal(continuationRequests[1].body.threadId, continuationRequests[0].body.threadId);
-    assert.equal(continuationRequests[0].headers["x-session-id"], continuationRequests[0].body.threadId);
-    assert.equal(continuationRequests[1].headers["x-session-id"], continuationRequests[0].body.threadId);
+    const calls = generateCalls.slice(before);
+    assert.equal(calls.length, 2);
+    assert.match(calls[0].body.threadId, /^[0-9a-f-]{36}$/i);
+    assert.equal(calls[0].body.threadId, calls[1].body.threadId);
   });
 
-  await t.test("waits for pause_turn response commit before continuing", async () => {
-    const capturedBefore = captured.length;
-    const response = await withTimeout(fetch(`${workerUrl}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer test-key" },
-      body: JSON.stringify({
-        model: "fixture/pause-after-commit",
-        messages: [{ role: "user", content: "Wait for the thread commit" }],
-      }),
-    }), 5_000, "pause_turn continuation did not complete after the first response committed");
-
-    assert.equal(response.status, 200);
-    const payload = await response.json();
-    assert.equal(delayedPauseContinuedBeforeCommit, false);
-    assert.equal(payload.choices[0].message.content, "committing continued");
-    assert.deepEqual(payload.usage, {
-      prompt_tokens: 5,
-      completion_tokens: 3,
-      total_tokens: 8,
+  await t.test("waits for the paused response to commit before continuing", async () => {
+    const response = await openai({
+      model: "fixture/pause-after-commit",
+      messages: [{ role: "user", content: "pause then continue" }],
     });
-
-    const continuationRequests = captured.slice(capturedBefore);
-    assert.equal(continuationRequests.length, 2);
-    assert.equal(continuationRequests[1].body.threadId, continuationRequests[0].body.threadId);
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).choices[0].message.content, "committing continued");
+    assert.equal(
+      delayedPauseContinuedBeforeCommit,
+      false,
+      "the continuation was issued before the paused response finished",
+    );
   });
 
   await t.test("treats finish-step as a boundary instead of truncating later output", async () => {
-    const response = await fetch(`${workerUrl}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer test-key" },
-      body: JSON.stringify({
-        model: "fixture/finish-step-boundary",
-        messages: [{ role: "user", content: "Complete both steps" }],
-      }),
+    const response = await openai({
+      model: "fixture/finish-step-boundary",
+      messages: [{ role: "user", content: "Complete both steps" }],
     });
-
     assert.equal(response.status, 200);
     const payload = await response.json();
     assert.equal(payload.choices[0].message.content, "step-one-step-two");
     assert.equal(payload.choices[0].finish_reason, "stop");
-    assert.deepEqual(payload.usage, {
-      prompt_tokens: 3,
-      completion_tokens: 2,
-      total_tokens: 5,
-    });
+    assert.deepEqual(payload.usage, { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 });
   });
 
-  await t.test("closes an idle upstream after a downstream disconnect", async () => {
-    await withTimeout(new Promise((resolve, reject) => {
-      let disconnected = false;
-      const request = httpRequest(`${workerUrl}/v1/chat/completions`, {
-        method: "POST",
-        headers: { "content-type": "application/json", authorization: "Bearer test-key" },
-      }, (response) => {
-        assert.equal(response.statusCode, 200);
-        let received = "";
-        response.setEncoding("utf8");
-        response.on("data", (chunk) => {
-          received += chunk;
-          if (disconnected || !received.includes("cancel me")) return;
-          disconnected = true;
-          response.destroy();
-          request.destroy();
-          resolve();
-        });
-      });
-      request.once("error", (error) => {
-        if (!disconnected) reject(error);
-      });
-      request.end(JSON.stringify({
-        model: "fixture/cancel-open",
-        messages: [{ role: "user", content: "Start and then cancel" }],
-        stream: true,
-      }));
-    }), 2_000, "stream did not produce data before the downstream disconnect");
-    await withTimeout(
-      cancelUpstreamClosed.promise,
-      3_000,
-      "idle fallback did not close the upstream after the downstream disconnected",
-    );
-  });
-
-  await t.test("completes and closes an open upstream response after abort", async () => {
-    const response = await fetch(`${workerUrl}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer test-key" },
-      body: JSON.stringify({
-        model: "fixture/abort-open",
-        messages: [{ role: "user", content: "Abort without EOF" }],
-        stream: true,
-      }),
-    });
-
-    assert.equal(response.status, 200);
-    const stream = await withTimeout(
-      response.text(),
-      2_000,
-      "abort event did not terminate the downstream stream",
-    );
-    const parsed = parseOpenAIStream(stream);
-    assert.equal(
-      parsed.chunks.map((chunk) => chunk.choices?.[0]?.delta?.content ?? "").join(""),
-      "before open abort",
-    );
-    assert.equal(parsed.chunks.filter((chunk) => chunk.choices?.[0]?.finish_reason === "stop").length, 1);
-    assert.equal(parsed.done, true);
-    await withTimeout(
-      abortUpstreamClosed.promise,
-      2_000,
-      "upstream response stayed open after its abort event",
-    );
-  });
-
-  await t.test("translates OpenAI streaming and tool round trips", async () => {
-    const streamResponse = await fetch(`${workerUrl}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer test-key" },
-      body: JSON.stringify({
-        model: "deepseek/deepseek-v4-flash",
-        messages: [{ role: "user", content: "Hi" }],
-        stream: true,
-        stream_options: { include_usage: true },
-      }),
-    });
-    const stream = await streamResponse.text();
-    const parsedStream = parseOpenAIStream(stream);
-    assert.equal(parsedStream.done, true);
-    assert.equal(
-      parsedStream.chunks
-        .map((chunk) => chunk.choices?.[0]?.delta?.reasoning_content ?? "")
-        .join(""),
-      "think",
-    );
-    assert(parsedStream.chunks.some((chunk) => chunk.choices?.[0]?.finish_reason === "stop"));
-    const usageChunks = parsedStream.chunks.filter((chunk) => Array.isArray(chunk.choices) && chunk.choices.length === 0);
-    assert.equal(usageChunks.length, 1);
-    assert.deepEqual(usageChunks[0].usage, { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 });
-
-    const toolResponse = await fetch(`${workerUrl}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer test-key" },
-      body: JSON.stringify({
-        model: "deepseek/deepseek-v4-flash",
-        messages: [{ role: "user", content: "Weather?" }],
-        tools: [{ type: "function", function: { name: "weather", parameters: { type: "object" } } }],
-      }),
-    });
-    const toolPayload = await toolResponse.json();
-    assert.equal(toolPayload.choices[0].finish_reason, "tool_calls");
-    assert.equal(toolPayload.choices[0].message.tool_calls[0].function.arguments, '{"city":"Singapore"}');
-
-    const resultResponse = await fetch(`${workerUrl}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer test-key" },
-      body: JSON.stringify({
-        model: "deepseek/deepseek-v4-flash",
-        messages: [
-          {
-            role: "assistant",
-            content: null,
-            reasoning_content: "prior thought",
-            tool_calls: [{ id: "call_weather", type: "function", function: { name: "weather", arguments: '{"city":"Singapore"}' } }],
-          },
-          { role: "tool", tool_call_id: "call_weather", content: "30 C" },
-        ],
-      }),
-    });
-    const resultPayload = await resultResponse.json();
-    assert.equal(resultPayload.choices[0].message.content, "tool result received");
-    const resultRequest = captured.at(-1).body;
-    assert.deepEqual(resultRequest.params.messages[0].content[0], { type: "reasoning", text: "prior thought" });
-    assert.equal(resultRequest.params.messages[0].content[1].type, "tool-call");
-    assert.equal(resultRequest.params.messages[1].role, "tool");
-    assert.equal(resultRequest.params.messages[1].content[0].type, "tool-result");
-  });
-
-  await t.test("coerces upstream tool inputs to JSON objects", async () => {
-    const response = await fetch(`${workerUrl}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer test-key" },
-      body: JSON.stringify({
-        model: "fixture/tool-coercion",
-        messages: [{ role: "user", content: "Run every tool" }],
-        tools: [
-          { type: "function", function: { name: "null_tool", parameters: { type: "object", properties: {} } } },
-          { type: "function", function: { name: "array_tool", parameters: { type: "object", properties: { value: { type: "string" } } } } },
-          { type: "function", function: { name: "json_tool", parameters: { type: "object", properties: { value: { type: "string" } } } } },
-          {
-            type: "function",
-            function: {
-              name: "bare_tool",
-              parameters: { type: "object", properties: { value: { type: "string" } }, required: ["value"] },
-            },
-          },
-        ],
-      }),
+  await t.test("promotes a trailing finish-step when no finish arrives", async () => {
+    const response = await openai({
+      model: "fixture/finish-step-only",
+      messages: [{ role: "user", content: "legacy stream" }],
     });
     assert.equal(response.status, 200);
     const payload = await response.json();
-    const inputs = Object.fromEntries(payload.choices[0].message.tool_calls.map((toolCall) => {
-      const input = JSON.parse(toolCall.function.arguments);
-      assert.equal(typeof input, "object");
-      assert.equal(Array.isArray(input), false);
-      assert.notEqual(input, null);
-      return [toolCall.id, input];
-    }));
-    assert.deepEqual(inputs, {
-      call_null: {},
-      call_array: { value: "array" },
-      call_json: { value: "json" },
-      call_bare: { value: "bare" },
-    });
+    assert.equal(payload.choices[0].message.content, "legacy");
+    assert.deepEqual(payload.usage, { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 });
   });
 
-  await t.test("does not expose provider-executed tools to OpenAI clients", async () => {
-    const response = await fetch(`${workerUrl}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer test-key" },
-      body: JSON.stringify({
-        model: "fixture/provider-tools",
-        messages: [{ role: "user", content: "Search" }],
-        tools: [{ type: "function", function: { name: "web_search", parameters: { type: "object" } } }],
-      }),
+  await t.test("reports a stream that ended before completion", async () => {
+    const response = await openai({
+      model: "fixture/truncated",
+      messages: [{ role: "user", content: "cut me off" }],
     });
-    assert.equal(response.status, 200);
-    const payload = await response.json();
-    assert.equal(payload.choices[0].message.content, "provider tool complete");
-    assert.equal(payload.choices[0].finish_reason, "stop");
-    assert.equal("tool_calls" in payload.choices[0].message, false);
+    assert.equal(response.status, 502);
+    assert.match((await response.json()).error.message, /truncated/i);
   });
 
-  await t.test("counts filtered provider events as upstream activity", async () => {
-    const response = await fetch(`${workerUrl}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer test-key" },
-      body: JSON.stringify({
-        model: "fixture/provider-tools-active",
-        messages: [{ role: "user", content: "Keep the provider stream alive" }],
-        stream: true,
-      }),
+  await t.test("streams one terminal chunk exactly once", async () => {
+    const response = await openai({
+      model: "fixture/finish-step-boundary",
+      messages: [{ role: "user", content: "stream both steps" }],
+      stream: true,
+      stream_options: { include_usage: true },
     });
-    assert.equal(response.status, 200);
-    const parsed = parseOpenAIStream(await response.text());
-    assert.equal(
-      parsed.chunks.map((chunk) => chunk.choices?.[0]?.delta?.content ?? "").join(""),
-      "provider activity preserved",
-    );
-    assert.equal(parsed.chunks.some((chunk) => chunk.error), false);
-    assert.equal(parsed.done, true);
+    const { chunks, done } = parseOpenAIStream(await response.text());
+    assert.equal(done, true);
+    assert.equal(openAIText(chunks), "step-one-step-two");
+    assert.equal(chunks.filter((chunk) => chunk.choices?.[0]?.finish_reason).length, 1);
+    const usage = chunks.at(-1).usage;
+    assert.deepEqual(usage, { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 });
   });
 
-  await t.test("keeps same-name streamed tool calls distinct by id", async () => {
-    const response = await fetch(`${workerUrl}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer test-key" },
-      body: JSON.stringify({
-        model: "fixture/same-name-tools",
-        messages: [{ role: "user", content: "Search twice" }],
-        tools: [{ type: "function", function: { name: "search", parameters: { type: "object" } } }],
-        stream: true,
-      }),
+  // ── streaming translation ────────────────────────────────────────
+
+  await t.test("translates an OpenAI stream and its tool round trip", async () => {
+    const response = await openai({
+      model: catalog.data[0].id,
+      messages: [{ role: "user", content: "Hi" }],
+      stream: true,
+      stream_options: { include_usage: true },
     });
-    assert.equal(response.status, 200);
-    const parsed = parseOpenAIStream(await response.text());
-    const toolDeltas = parsed.chunks.flatMap((chunk) => chunk.choices?.[0]?.delta?.tool_calls ?? []);
-    assert.deepEqual(toolDeltas.map((toolCall) => toolCall.id), ["call_search_one", "call_search_two"]);
-    assert.deepEqual(toolDeltas.map((toolCall) => toolCall.index), [0, 1]);
-    assert.deepEqual(toolDeltas.map((toolCall) => JSON.parse(toolCall.function.arguments)), [
-      { query: "one" },
-      { query: "two" },
+    assert.equal(response.headers.get("content-type"), "text/event-stream");
+
+    const { chunks, done } = parseOpenAIStream(await response.text());
+    assert.equal(done, true);
+    assert.equal(chunks[0].choices[0].delta.role, "assistant");
+    assert.equal(chunks.map((chunk) => chunk.choices?.[0]?.delta?.reasoning_content ?? "").join(""), "think");
+    assert.equal(openAIText(chunks), "hello");
+    assert.equal(chunks.at(-1).usage.total_tokens, 5);
+
+    const toolResponse = await openai({
+      model: "fixture/tools",
+      messages: [{ role: "user", content: "weather in Singapore?" }],
+      tools: [{ type: "function", function: { name: "weather", parameters: { type: "object" } } }],
+      stream: true,
+    });
+    const toolCalls = openAIToolCalls(parseOpenAIStream(await toolResponse.text()).chunks);
+    assert.deepEqual(toolCalls, [
+      { id: "call_weather", name: "weather", arguments: '{"city":"Singapore"}' },
     ]);
-    assert(parsed.chunks.some((chunk) => chunk.choices?.[0]?.finish_reason === "tool_calls"));
-    assert.equal(parsed.done, true);
   });
 
-  await t.test("translates Anthropic streaming and tool results", async () => {
-    const streamResponse = await fetch(`${workerUrl}/v1/messages`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-api-key": "test-key" },
-      body: JSON.stringify({
-        model: "deepseek/deepseek-v4-flash",
-        max_tokens: 1024,
-        messages: [{ role: "user", content: "Hi" }],
-        stream: true,
-      }),
+  await t.test("keeps interleaved streamed tool calls distinct by id", async () => {
+    const response = await openai({
+      model: "fixture/streamed-tools",
+      messages: [{ role: "user", content: "search twice" }],
+      stream: true,
     });
-    const stream = await streamResponse.text();
-    assert.match(stream, /"type":"thinking_delta","thinking":"think"/);
-    assert.match(stream, /"stop_reason":"end_turn"/);
-    assert.match(stream, /event: message_stop/);
+    const { chunks } = parseOpenAIStream(await response.text());
+    // Deltas that arrive out of order must land on their own call, and the
+    // redundant trailing `tool-call` must not repeat what they already sent.
+    assert.deepEqual(openAIToolCalls(chunks), [
+      { id: "call_a", name: "search", arguments: '{"query":"one"}' },
+      { id: "call_b", name: "search", arguments: '{"query":"two"}' },
+    ]);
+    assert.equal(chunks.at(-1).choices[0].finish_reason, "tool_calls");
+  });
 
-    const resultResponse = await fetch(`${workerUrl}/v1/messages`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-api-key": "test-key" },
-      body: JSON.stringify({
-        model: "deepseek/deepseek-v4-flash",
-        max_tokens: 1024,
-        messages: [
-          { role: "assistant", content: [{ type: "tool_use", id: "call_weather", name: "weather", input: { city: "Singapore" } }] },
-          { role: "user", content: [{ type: "tool_result", tool_use_id: "call_weather", content: "30 C" }] },
-        ],
-      }),
+  await t.test("serializes interleaved Anthropic content blocks", async () => {
+    const response = await anthropic({
+      model: "fixture/interleaved-blocks",
+      max_tokens: 64,
+      messages: [{ role: "user", content: "think then answer" }],
+      stream: true,
     });
-    const payload = await resultResponse.json();
-    assert.equal(payload.content[0].text, "tool result received");
-    const request = captured.at(-1).body;
-    assert.equal(request.params.messages[0].content[0].type, "tool-call");
-    assert.equal(request.params.messages[1].content[0].type, "tool-result");
+    const events = parseAnthropicStream(await response.text());
+    const names = events.map((event) => event.event);
+    assert.equal(names[0], "message_start");
+    assert.equal(names.at(-1), "message_stop");
 
-    const cacheResponse = await fetch(`${workerUrl}/v1/messages`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-api-key": "test-key" },
-      body: JSON.stringify({
-        model: "fixture/cache-usage",
-        max_tokens: 128,
-        messages: [{ role: "user", content: "Use cache" }],
-      }),
+    // Anthropic clients cannot handle two open blocks, so a displaced block is
+    // closed before the next one opens, and every start has exactly one stop.
+    const starts = events.filter((event) => event.event === "content_block_start");
+    const stops = events.filter((event) => event.event === "content_block_stop");
+    assert.equal(starts.length, 2);
+    assert.equal(stops.length, 2);
+    assert.deepEqual(starts.map((event) => event.data.content_block.type), ["thinking", "text"]);
+    assert.deepEqual(starts.map((event) => event.data.index), [0, 1]);
+
+    let open = null;
+    for (const event of events) {
+      if (event.event === "content_block_start") {
+        assert.equal(open, null, "a content block opened while another was still open");
+        open = event.data.index;
+      } else if (event.event === "content_block_stop") {
+        assert.equal(open, event.data.index);
+        open = null;
+      } else if (event.event === "content_block_delta") {
+        assert.equal(open, event.data.index);
+      }
+    }
+    assert.equal(open, null);
+  });
+
+  await t.test("translates an Anthropic stream and its tool blocks", async () => {
+    const response = await anthropic({
+      model: "fixture/streamed-tools",
+      max_tokens: 64,
+      messages: [{ role: "user", content: "search twice" }],
+      tools: [{ name: "search", input_schema: { type: "object" } }],
+      stream: true,
     });
-    assert.equal(cacheResponse.status, 200);
-    const cachePayload = await cacheResponse.json();
-    assert.deepEqual(cachePayload.usage, {
-      input_tokens: 9,
+    const events = parseAnthropicStream(await response.text());
+    const toolStarts = events.filter(
+      (event) => event.event === "content_block_start" && event.data.content_block.type === "tool_use",
+    );
+    assert.deepEqual(toolStarts.map((event) => event.data.content_block.id), ["call_a", "call_b"]);
+
+    const json = new Map();
+    for (const event of events) {
+      if (event.event !== "content_block_delta" || event.data.delta.type !== "input_json_delta") continue;
+      json.set(event.data.index, (json.get(event.data.index) ?? "") + event.data.delta.partial_json);
+    }
+    assert.deepEqual([...json.values()], ['{"query":"one"}', '{"query":"two"}']);
+
+    const stop = events.find((event) => event.event === "message_delta");
+    assert.equal(stop.data.delta.stop_reason, "tool_use");
+  });
+
+  await t.test("reports Anthropic usage with cache reads excluded from input tokens", async () => {
+    const response = await anthropic({
+      model: "fixture/cache-usage",
+      max_tokens: 64,
+      messages: [{ role: "user", content: "cached" }],
+    });
+    assert.equal(response.status, 200);
+    // `inputTokens` on the wire already includes the cached tokens; Anthropic's
+    // `input_tokens` excludes them, so double counting would inflate the bill.
+    assert.deepEqual((await response.json()).usage, {
+      input_tokens: 3,
       output_tokens: 2,
       cache_read_input_tokens: 6,
       cache_creation_input_tokens: 4,
     });
   });
 
-  await t.test("forwards Anthropic output_config.effort for upstream validation", async () => {
-    const response = await fetch(`${workerUrl}/v1/messages`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-api-key": "test-key" },
-      body: JSON.stringify({
-        model: "gpt-5.6-sol",
-        max_tokens: 128,
-        messages: [{ role: "user", content: "Think" }],
-        output_config: { effort: "high" },
-      }),
-    });
-    assert.equal(response.status, 200);
-    assert.equal(captured.at(-1).body.params.model, "gpt-5.6-sol");
-    assert.equal(captured.at(-1).body.params.reasoning_effort, "high");
-  });
-
-  await t.test("rejects an invalid reasoning effort before calling upstream", async () => {
-    const capturedBefore = captured.length;
-    const response = await fetch(`${workerUrl}/v1/messages`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-api-key": "test-key" },
-      body: JSON.stringify({
-        model: "gpt-5.6-sol",
-        max_tokens: 128,
-        messages: [{ role: "user", content: "Think" }],
-        output_config: { effort: "ultra" },
-      }),
-    });
-    assert.equal(response.status, 400);
-    const payload = await response.json();
-    assert.equal(payload.type, "error");
-    assert.equal(payload.error.type, "invalid_request_error");
-    assert.match(payload.error.message, /effort/i);
-    assert.equal(captured.length, capturedBefore);
-  });
-
-  await t.test("does not expose provider-executed tools to Anthropic clients", async () => {
-    const response = await fetch(`${workerUrl}/v1/messages`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-api-key": "test-key" },
-      body: JSON.stringify({
-        model: "fixture/provider-tools",
-        max_tokens: 128,
-        messages: [{ role: "user", content: "Search" }],
-        tools: [{ name: "web_search", input_schema: { type: "object" } }],
-      }),
+  await t.test("returns a whole Anthropic message for a non-streaming caller", async () => {
+    const response = await anthropic({
+      model: catalog.data[0].id,
+      max_tokens: 64,
+      messages: [{ role: "user", content: "Hi" }],
     });
     assert.equal(response.status, 200);
     const payload = await response.json();
-    assert.deepEqual(payload.content, [{ type: "text", text: "provider tool complete" }]);
+    assert.equal(payload.type, "message");
+    assert.equal(payload.role, "assistant");
+    assert.equal(payload.model, catalog.data[0].id);
+    assert.deepEqual(payload.content, [
+      { type: "thinking", thinking: "think", signature: "" },
+      { type: "text", text: "hello" },
+    ]);
     assert.equal(payload.stop_reason, "end_turn");
   });
 
-  await t.test("treats abort as a normal completed response", async () => {
-    const openAIResponse = await fetch(`${workerUrl}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer test-key" },
-      body: JSON.stringify({
-        model: "fixture/abort",
-        messages: [{ role: "user", content: "Stop cleanly" }],
-      }),
-    });
-    assert.equal(openAIResponse.status, 200);
-    const openAIPayload = await openAIResponse.json();
-    assert.equal(openAIPayload.choices[0].message.content, "before abort");
-    assert.equal(openAIPayload.choices[0].finish_reason, "stop");
-    assert.deepEqual(openAIPayload.usage, { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 });
+  // ── tool input repair and provider-executed tools ────────────────
 
-    const anthropicResponse = await fetch(`${workerUrl}/v1/messages`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-api-key": "test-key" },
-      body: JSON.stringify({
-        model: "fixture/abort",
-        max_tokens: 128,
-        messages: [{ role: "user", content: "Stop cleanly" }],
-        stream: true,
-      }),
+  await t.test("repairs upstream tool inputs into JSON objects", async () => {
+    const response = await openai({
+      model: "fixture/tool-coercion",
+      messages: [{ role: "user", content: "coerce" }],
+      tools: [
+        { type: "function", function: { name: "null_tool", parameters: { type: "object" } } },
+        { type: "function", function: { name: "array_tool", parameters: { type: "object" } } },
+        { type: "function", function: { name: "json_tool", parameters: { type: "object" } } },
+        {
+          type: "function",
+          function: {
+            name: "bare_tool",
+            parameters: { type: "object", properties: { text: { type: "string" } }, required: ["text"] },
+          },
+        },
+        {
+          type: "function",
+          function: {
+            name: "list_tool",
+            parameters: { type: "object", properties: { items: { type: "array" } }, required: ["items"] },
+          },
+        },
+      ],
     });
-    assert.equal(anthropicResponse.status, 200);
-    const anthropicStream = await anthropicResponse.text();
-    assert.match(anthropicStream, /"stop_reason":"end_turn"/);
-    assert.match(anthropicStream, /event: message_stop/);
-    assert.doesNotMatch(anthropicStream, /event: error/);
+    assert.equal(response.status, 200);
+
+    const calls = (await response.json()).choices[0].message.tool_calls;
+    assert.deepEqual(calls.map((call) => call.function.arguments), [
+      "{}",
+      '{"value":"array"}',
+      '{"value":"json"}',
+      // A bare string is only recoverable when the schema names exactly one
+      // required argument for it to fill.
+      '{"text":"bare"}',
+      '{"items":["listed"]}',
+    ]);
   });
 
-  await t.test("rejects malformed JSON and missing required fields", async () => {
-    for (const fixture of [
-      {
-        name: "OpenAI malformed JSON",
-        path: "/v1/chat/completions",
-        headers: { "content-type": "application/json", authorization: "Bearer test-key" },
-        body: "{",
-      },
-      {
-        name: "Anthropic malformed JSON",
-        path: "/v1/messages",
-        headers: { "content-type": "application/json", "x-api-key": "test-key" },
-        body: "{",
-      },
-      {
-        name: "OpenAI missing model",
-        path: "/v1/chat/completions",
-        headers: { "content-type": "application/json", authorization: "Bearer test-key" },
-        body: JSON.stringify({ messages: [] }),
-      },
-      {
-        name: "Anthropic missing messages",
-        path: "/v1/messages",
-        headers: { "content-type": "application/json", "x-api-key": "test-key" },
-        body: JSON.stringify({ model: "gpt-5.6-sol", max_tokens: 128 }),
-      },
-      {
-        name: "OpenAI null body",
-        path: "/v1/chat/completions",
-        headers: { "content-type": "application/json", authorization: "Bearer test-key" },
-        body: "null",
-      },
-    ]) {
-      const capturedBefore = captured.length;
-      const response = await fetch(`${workerUrl}${fixture.path}`, {
-        method: "POST",
-        headers: fixture.headers,
-        body: fixture.body,
-      });
-      assert.equal(response.status, 400, fixture.name);
-      const payload = await response.json();
-      const error = payload.error;
-      assert.equal(error.type, "invalid_request_error", fixture.name);
-      assert.equal(captured.length, capturedBefore, fixture.name);
-    }
+  await t.test("does not expose provider-executed tools to either protocol", async () => {
+    const completion = await openai({
+      model: "fixture/provider-tools",
+      messages: [{ role: "user", content: "search the web" }],
+    });
+    const payload = await completion.json();
+    assert.equal(payload.choices[0].message.tool_calls, undefined);
+    assert.equal(payload.choices[0].message.content, "provider tool complete");
+    // The gateway reports tool-calls for its own server-side tool; reporting
+    // that to a caller with no tool call to answer strands the conversation.
+    assert.equal(payload.choices[0].finish_reason, "stop");
+
+    const message = await anthropic({
+      model: "fixture/provider-tools",
+      max_tokens: 64,
+      messages: [{ role: "user", content: "search the web" }],
+    });
+    const anthropicPayload = await message.json();
+    assert.deepEqual(anthropicPayload.content, [{ type: "text", text: "provider tool complete" }]);
+    assert.equal(anthropicPayload.stop_reason, "end_turn");
+  });
+
+  await t.test("counts filtered provider events as upstream activity", async () => {
+    // The idle timeout is 1s here and the fixture is quiet for 1.2s except for
+    // events this Worker drops; treating them as silence would kill the turn.
+    const response = await openai({
+      model: "fixture/provider-tools-active",
+      messages: [{ role: "user", content: "slow provider tool" }],
+      stream: true,
+    });
+    const { chunks, done } = parseOpenAIStream(await response.text());
+    assert.equal(done, true);
+    assert.equal(openAIText(chunks), "provider activity preserved");
+    assert.equal(chunks.some((chunk) => chunk.error), false);
+  });
+
+  // ── failure and cancellation ─────────────────────────────────────
+
+  await t.test("treats abort as a completed response", async () => {
+    const completion = await openai({
+      model: "fixture/abort",
+      messages: [{ role: "user", content: "abort" }],
+    });
+    assert.equal(completion.status, 200);
+    const payload = await completion.json();
+    assert.equal(payload.choices[0].message.content, "before abort");
+    assert.equal(payload.choices[0].finish_reason, "stop");
+
+    const streamed = await openai({
+      model: "fixture/abort",
+      messages: [{ role: "user", content: "abort" }],
+      stream: true,
+    });
+    const { chunks, done } = parseOpenAIStream(await streamed.text());
+    assert.equal(done, true);
+    assert.equal(openAIText(chunks), "before abort");
+    assert.equal(chunks.filter((chunk) => chunk.choices?.[0]?.finish_reason === "stop").length, 1);
+  });
+
+  await t.test("completes and closes an open upstream response after abort", async () => {
+    const response = await openai({
+      model: "fixture/abort-open",
+      messages: [{ role: "user", content: "Abort without EOF" }],
+      stream: true,
+    });
+    assert.equal(response.status, 200);
+    const stream = await withTimeout(response.text(), 3_000, "abort did not terminate the downstream stream");
+    const { chunks, done } = parseOpenAIStream(stream);
+    assert.equal(openAIText(chunks), "before open abort");
+    assert.equal(done, true);
+    await withTimeout(
+      abortUpstreamClosed.promise,
+      3_000,
+      "upstream response stayed open after its abort event",
+    );
+  });
+
+  await t.test("closes an idle upstream after a downstream disconnect", async () => {
+    await withTimeout(
+      new Promise((resolve, reject) => {
+        let disconnected = false;
+        const request = httpRequest(
+          `${workerUrl}/v1/chat/completions`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json", authorization: `Bearer ${PLAN_KEY}` },
+          },
+          (response) => {
+            assert.equal(response.statusCode, 200);
+            let received = "";
+            response.setEncoding("utf8");
+            response.on("data", (chunk) => {
+              received += chunk;
+              if (disconnected || !received.includes("cancel me")) return;
+              disconnected = true;
+              response.destroy();
+              request.destroy();
+              resolve();
+            });
+          },
+        );
+        request.once("error", (error) => {
+          if (!disconnected) reject(error);
+        });
+        request.end(
+          JSON.stringify({
+            model: "fixture/cancel-open",
+            messages: [{ role: "user", content: "Start and then cancel" }],
+            stream: true,
+          }),
+        );
+      }),
+      3_000,
+      "stream did not produce data before the downstream disconnect",
+    );
+
+    await withTimeout(
+      cancelUpstreamClosed.promise,
+      4_000,
+      "the upstream stayed open after the downstream disconnected",
+    );
   });
 
   await t.test("turns upstream stream failures into compatible API errors", async () => {
-    const openAIResponse = await fetch(`${workerUrl}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer test-key" },
-      body: JSON.stringify({ model: "stream-error", messages: [{ role: "user", content: "Hi" }] }),
+    const completion = await openai({
+      model: "fixture/rate-limit",
+      messages: [{ role: "user", content: "too fast" }],
     });
-    assert.equal(openAIResponse.status, 502);
-    const openAIError = await openAIResponse.json();
-    assert.match(openAIError.error.message, /fixture failure/);
+    assert.equal(completion.status, 429);
+    const payload = await completion.json();
+    assert.equal(payload.error.type, "rate_limit_error");
+    assert.equal(payload.error.is_retryable, true);
 
-    const anthropicResponse = await fetch(`${workerUrl}/v1/messages`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-api-key": "test-key" },
-      body: JSON.stringify({ model: "truncated", max_tokens: 128, messages: [{ role: "user", content: "Hi" }] }),
+    // An error arriving after the head is written can only be reported inside
+    // the stream, and the stream must still terminate cleanly.
+    const streamed = await openai({
+      model: "fixture/stream-error",
+      messages: [{ role: "user", content: "fail" }],
+      stream: true,
     });
-    assert.equal(anthropicResponse.status, 502);
-    const anthropicError = await anthropicResponse.json();
-    assert.match(anthropicError.error.message, /before a finish event/);
+    assert.equal(streamed.status, 200);
+    const { chunks, done } = parseOpenAIStream(await streamed.text());
+    assert.equal(done, true);
+    assert.equal(chunks.find((chunk) => chunk.error)?.error.message, "fixture failure");
 
-    const rateLimitResponse = await fetch(`${workerUrl}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer test-key" },
-      body: JSON.stringify({
-        model: "fixture/rate-limit",
-        messages: [{ role: "user", content: "Retry?" }],
-      }),
+    const message = await anthropic({
+      model: "fixture/stream-error",
+      max_tokens: 32,
+      messages: [{ role: "user", content: "fail" }],
+      stream: true,
     });
-    assert.equal(rateLimitResponse.status, 429);
-    const rateLimitError = await rateLimitResponse.json();
-    assert.equal(rateLimitError.error.type, "rate_limit_error");
-    assert.equal(rateLimitError.error.is_retryable, true);
-    assert.match(rateLimitError.error.message, /slow down/);
+    const events = parseAnthropicStream(await message.text());
+    assert.equal(events.find((event) => event.event === "error")?.data.error.message, "fixture failure");
+    assert.equal(events.at(-1).event, "message_stop");
+  });
+
+  await t.test("unwraps an error message that embeds the provider's own JSON", async () => {
+    const response = await openai({
+      model: "fixture/embedded-error",
+      messages: [{ role: "user", content: "busy" }],
+    });
+    assert.equal(response.status, 429);
+    const payload = await response.json();
+    assert.equal(payload.error.message, "rate_limit: upstream is busy");
+    assert.equal(payload.error.type, "rate_limit_error");
+  });
+
+  // ── request validation and CORS ──────────────────────────────────
+
+  await t.test("rejects malformed and incomplete requests", async () => {
+    const noKey = await fetch(`${workerUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "m", messages: [] }),
+    });
+    assert.equal(noKey.status, 401);
+    assert.equal((await noKey.json()).error.type, "authentication_error");
+
+    const badJson = await fetch(`${workerUrl}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": PLAN_KEY },
+      body: "{not json",
+    });
+    assert.equal(badJson.status, 400);
+    const badJsonPayload = await badJson.json();
+    assert.equal(badJsonPayload.type, "error");
+    assert.equal(badJsonPayload.error.type, "invalid_request_error");
+
+    for (const body of [{ messages: [] }, { model: "  " }, { model: "m" }]) {
+      const response = await openai(body);
+      assert.equal(response.status, 400);
+    }
+
+    const missing = await fetch(`${workerUrl}/v1/nope`, { method: "POST" });
+    assert.equal(missing.status, 404);
+  });
+
+  await t.test("accepts an Anthropic key on the OpenAI route and the reverse", async () => {
+    const viaXApiKey = await fetch(`${workerUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": PLAN_KEY },
+      body: JSON.stringify({ model: "fixture/echo", messages: [{ role: "user", content: "hi" }] }),
+    });
+    assert.equal(viaXApiKey.status, 200);
+
+    const viaBearer = await fetch(`${workerUrl}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${PLAN_KEY}` },
+      body: JSON.stringify({ model: "fixture/echo", max_tokens: 16, messages: [{ role: "user", content: "hi" }] }),
+    });
+    assert.equal(viaBearer.status, 200);
   });
 
   await t.test("allows browser SDK preflight headers", async () => {
@@ -973,12 +1357,22 @@ test("command-code worker contract", async (t) => {
       headers: {
         origin: "https://example.test",
         "access-control-request-method": "POST",
-        "access-control-request-headers": "content-type, x-api-key, x-stainless-runtime, anthropic-beta",
+        "access-control-request-headers": "content-type, x-api-key, anthropic-dangerous-direct-browser-access",
       },
     });
     assert.equal(response.status, 200);
-    const allowed = response.headers.get("access-control-allow-headers") ?? "";
-    assert.match(allowed, /x-stainless-runtime/i);
-    assert.match(allowed, /anthropic-beta/i);
+    assert.equal(response.headers.get("access-control-allow-origin"), "*");
+    const allowed = response.headers.get("access-control-allow-headers").split(",").map((h) => h.trim());
+    for (const header of ["content-type", "x-api-key", "anthropic-dangerous-direct-browser-access"]) {
+      assert(allowed.includes(header), `preflight did not allow ${header}`);
+    }
+  });
+
+  await t.test("never spent more than one refusal on the coding-plan key", () => {
+    assert.equal(
+      providerCalls.filter((call) => call.key === PLAN_KEY).length,
+      1,
+      "the entitlement refusal should be learned once, not re-bought per turn",
+    );
   });
 });
