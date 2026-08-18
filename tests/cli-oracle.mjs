@@ -282,6 +282,11 @@ test("installed command-code CLI preserves the adapted generate wire contract", 
     assert.equal(body.params.model, oracleModel);
     assert.equal(body.params.max_tokens, 64_000);
     assert.equal(body.params.stream, true);
+    // The CLI always sends a system prompt, and so does the adapter: an empty
+    // one is the gateway's cue to splice in Command Code's own agent preamble
+    // and bill it to whoever made the call.
+    assert.equal(typeof body.params.system, "string");
+    assert(body.params.system.length > 0, "CLI should always send a system prompt");
     assert.equal("temperature" in body.params, false);
     assert(Array.isArray(body.params.messages));
     assert.deepEqual(body.params.messages, [{

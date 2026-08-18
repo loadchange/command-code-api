@@ -1,6 +1,6 @@
 {
   "name": "command-code-api",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
   "engines": {
     "node": ">=22"
@@ -15,7 +15,7 @@
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250505.0",
-    "command-code": "^1.6.1",
+    "command-code": "^1.27.1",
     "typescript": "^5.8.0",
     "wrangler": "^4.0.0"
   }

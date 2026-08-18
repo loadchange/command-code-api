@@ -1,6 +1,6 @@
 # command-code-api
 
-Cloudflare Worker that adapts the Command Code API to standard OpenAI and Anthropic formats. The outbound client-version header follows the installed `command-code` npm package, while the model endpoints proxy Command Code's official live Provider API catalog. The OpenAI/Anthropic-to-Command Code wire adapter remains code maintained in this repository.
+A Cloudflare Worker that serves Command Code's model catalog over the two protocols coding clients already speak: OpenAI chat completions and Anthropic messages.
 
 ## Endpoints
 
@@ -10,23 +10,43 @@ Cloudflare Worker that adapts the Command Code API to standard OpenAI and Anthro
 | `POST /v1/messages` | Anthropic | Claude Code, Anthropic-compatible clients |
 | `GET /v1/models` | OpenAI | Model discovery |
 | `GET /models` | OpenAI | Model discovery alias |
-| `GET /health` | - | Health check |
+| `GET /health` | — | Health check |
+
+Both completion endpoints accept the key as `Authorization: Bearer <key>` or `x-api-key: <key>`, stream or not, with tools, images, reasoning, and multi-turn tool results.
+
+## Two upstream routes, one API
+
+Command Code sells two ways to reach the same catalog, and only one is documented.
+
+**`POST /provider/v1/{chat/completions,messages}`** is the published Provider API. It speaks OpenAI and Anthropic natively — but it is an entitlement, not a credential. An account on the cheapest coding plan signs in fine, mints a real key, runs the official CLI all day, and still gets `403 upgrade_required` there.
+
+**`POST /alpha/generate`** is the route the `command-code` CLI itself uses for every turn it takes. It carries the CLI's own envelope rather than an OpenAI or Anthropic body, and it is not plan-gated.
+
+The Worker uses both:
+
+```
+                        ┌─ entitled ──→ /provider/v1/…      (forwarded verbatim)
+Client ──→ Worker ──────┤
+                        └─ 403 upgrade_required ──→ /alpha/generate  (translated)
+```
+
+A key's answer is remembered per credential fingerprint for six hours, so a refused plan pays that 403 once rather than once per turn. Nothing about the key itself is stored — only a truncated SHA-256 of it, in the isolate's memory.
+
+Set `COMMAND_CODE_ROUTE` to pin one route: `auto` (default), `provider`, or `generate`.
 
 ## Quick start
 
-Node.js 22 or newer is required by the installed Command Code CLI package.
+Node.js 22 or newer is required by the `command-code` package used for the version header and the protocol oracle.
 
 ```bash
 npm install
-npm run dev
+npm run dev      # http://localhost:8787
 ```
-
-Server runs at `http://localhost:8787`.
 
 ## Deploy
 
 ```bash
-npm run check
+npm run check    # typecheck + contract suite + CLI oracle + wrangler dry run
 npm run deploy
 ```
 
@@ -53,7 +73,7 @@ curl -N https://your-worker.workers.dev/v1/messages \
   -H "x-api-key: YOUR_COMMAND_CODE_KEY" \
   -H "anthropic-version: 2023-06-01" \
   -d '{
-    "model": "deepseek/deepseek-v4-flash",
+    "model": "claude-opus-5",
     "max_tokens": 1024,
     "messages": [{"role": "user", "content": "Hello"}],
     "stream": true
@@ -81,43 +101,58 @@ codex
 ### Cherry Studio / Chatbox / other UI
 
 - API Base URL: `https://your-worker.workers.dev/v1`
-- API Key: your command-code key
-- Model: `deepseek/deepseek-v4-flash`
+- API Key: your Command Code key
+- Model: any id from `GET /v1/models`
 
-The complete current list is available from `GET /v1/models`.
+## Configuration
 
-## Auth
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `COMMAND_CODE_API_BASE` | `https://api.commandcode.ai` | Gateway origin. Both routes are derived from it. |
+| `COMMAND_CODE_ROUTE` | `auto` | `auto`, `provider`, or `generate`. |
+| `COMMAND_CODE_STREAM_IDLE_TIMEOUT_MS` | `60000` | Abort a stream after this much upstream silence (1 000–600 000). |
+| `COMMAND_CODE_ZDR` | unset | `1` sends Command Code's zero-data-retention header on every turn. A caller can also send `x-cmd-zdr: 1` per request. |
 
-The API key is passed through to Command Code's generation API (`api.commandcode.ai`). No key is stored in the worker. Model discovery uses Command Code's public endpoint and does not forward the caller's API key.
+No key is ever stored. Model discovery deliberately does not forward the caller's key.
 
-- OpenAI format: `Authorization: Bearer <key>`
-- Anthropic format: `x-api-key: <key>`
+## How the translation works
 
-## How it works
+`/alpha/generate` takes the Vercel AI SDK `ModelMessage[]` schema, which is neither Anthropic content blocks nor OpenAI tool messages — sending either verbatim answers *"Invalid prompt: The messages do not match the ModelMessage[] schema"*. The details that matter:
+
+- **System prompts are a field, not a turn.** A request with no system prompt of its own gets a neutral one, because an empty `system` is the gateway's cue to splice in Command Code's own multi-thousand-token agent preamble — billed to the caller, and telling the model it is Command Code.
+- **Tool results live in their own `tool` message**, never folded into a user turn, and consecutive results merge into one message. Each result carries the name of the tool its call named.
+- **Tool inputs are repaired** the way the CLI repairs them: `null`, single-element arrays, JSON strings, and bare strings all become the object the schema requires.
+- **The response is newline-delimited JSON**, not SSE, and its logical blocks interleave. OpenAI chunks tolerate that; Anthropic content blocks do not, so blocks are serialized and the open one is closed before the next opens.
+- **`pause_turn` is a continuation, not an ending.** The same thread is re-posted up to five times, and usage is summed across all of them.
+- **Provider-executed tools are not replayed** to the caller, which never declared them and cannot run them.
+- **Anthropic `input_tokens` excludes cache reads**, which the wire's `inputTokens` includes — counting both would inflate the caller's cost math.
+
+Streams send SSE keep-alives while the gateway is quiet, propagate a downstream cancellation to the upstream request, and report a mid-stream failure inside the stream before terminating it cleanly.
+
+## Layout
 
 ```
-Client  →  Worker  →  api.commandcode.ai/alpha/generate  →  selected model
-         (adapter)     (Command Code gateway)
+src/
+  index.ts              route table
+  env.ts                configuration
+  http.ts               CORS, JSON, SSE, credentials
+  errors.ts             one error vocabulary for both protocols
+  protocol/             caller request  → Command Code wire
+  generate/             the /alpha/generate envelope, stream, and translator
+  upstream/             Provider API passthrough and plan entitlement memory
+  routes/               completions, messages, models
 ```
-
-The worker transforms structured messages, tools, reasoning events, usage, and SSE streams between OpenAI/Anthropic and Command Code's native protocol.
-
-Streaming responses send SSE keep-alives while Command Code is quiet. If the upstream sends no bytes for 60 seconds, the Worker aborts the stalled request; set `COMMAND_CODE_STREAM_IDLE_TIMEOUT_MS` to a value from `1000` to `600000` to override that limit. Downstream stream cancellation is propagated to the upstream request.
 
 ## Keeping Command Code in sync
 
-`command-code` is a development dependency used for the client-version header and protocol oracle. The Worker bundles its package version only; the Node CLI itself is not imported, executed, or bundled into the Worker.
-
-Updating the dependency refreshes the `x-command-code-version` header on the next build. It does **not** automatically update the wire adapter. Before merging an upgrade, review the Command Code changelog and native request/stream contract, then update the adapter and contract tests if message parts, headers, events, finish reasons, or error semantics changed.
+`command-code` is a development dependency used for the `x-command-code-version` header and as a protocol oracle. Only its version string is bundled; the CLI is never imported, executed, or shipped into the Worker.
 
 ```bash
 npm run update:command-code
 ```
 
-The update command installs the latest package and runs type checks, protocol contract tests, the real CLI oracle, and a Wrangler dry run. After reviewing the dependency and any required adapter changes, deploy explicitly with `npm run deploy`.
+That installs the latest release and runs type checks, the contract suite, the real CLI oracle, and a Wrangler dry run. The oracle launches the installed CLI against an isolated loopback server and compares its actual `/alpha/generate` request with the envelope this Worker builds, which catches most wire changes during an upgrade. Semantic changes still need human review: read the changelog, then update the adapter and its tests if message parts, headers, events, finish reasons, or error semantics moved.
 
-The contract suite also launches the installed CLI against an isolated loopback server and compares its real generate request with the adapter assumptions. This catches many wire-contract changes during an upgrade, but semantic changes still require human review.
+Dependabot opens the dependency PR and CI runs the same checks on it. It does not rewrite the adapter, auto-merge, or deploy — the lockfile keeps builds deterministic, so a new npm release reaches production only after review, merge, and an explicit `npm run deploy`.
 
-Dependabot checks for new major, minor, and patch releases daily and opens a dependency PR. CI runs the same checks on that PR, but Dependabot does not rewrite the wire adapter, auto-merge the PR, or deploy the Worker. The lockfile keeps builds deterministic, so a new npm release affects production only after its update is reviewed, merged, and deployed.
-
-`/v1/models` and `/models` proxy `GET https://api.commandcode.ai/provider/v1/models` on every request with `Cache-Control: no-store`. The response therefore follows Command Code's live canonical IDs and context lengths instead of a bundled document or local snapshot. The endpoint is public and the caller's key is deliberately not forwarded, so it is a global catalog rather than an account-plan or custom-BYO filtered list.
+`/v1/models` and `/models` proxy `GET https://api.commandcode.ai/provider/v1/models` on every request with `Cache-Control: no-store`, so the catalog follows Command Code's live canonical ids and context lengths rather than a bundled snapshot. That endpoint is public and the caller's key is deliberately withheld, so it returns the global catalog rather than an account-filtered one.
