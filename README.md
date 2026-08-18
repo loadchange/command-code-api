@@ -122,6 +122,7 @@ No key is ever stored. Model discovery deliberately does not forward the caller'
 - **System prompts are a field, not a turn.** A request with no system prompt of its own gets a neutral one, because an empty `system` is the gateway's cue to splice in Command Code's own multi-thousand-token agent preamble — billed to the caller, and telling the model it is Command Code.
 - **Tool results live in their own `tool` message**, never folded into a user turn, and consecutive results merge into one message. Each result carries the name of the tool its call named.
 - **Tool inputs are repaired** the way the CLI repairs them: `null`, single-element arrays, JSON strings, and bare strings all become the object the schema requires.
+- **Reasoning effort is normalized, not refused.** The ladder is `low | medium | high | xhigh | max`. OpenAI's `minimal` and `none` land on `low`, any other spelling a client sends lands on `medium`, and an effort the caller never asked for stays off the wire so the gateway applies the model's own default — several models take only part of the ladder.
 - **The response is newline-delimited JSON**, not SSE, and its logical blocks interleave. OpenAI chunks tolerate that; Anthropic content blocks do not, so blocks are serialized and the open one is closed before the next opens.
 - **`pause_turn` is a continuation, not an ending.** The same thread is re-posted up to five times, and usage is summed across all of them.
 - **Provider-executed tools are not replayed** to the caller, which never declared them and cannot run them.
