@@ -7,6 +7,20 @@ export const DEFAULT_MAX_OUTPUT_TOKENS = 64_000;
 
 const REASONING_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
 
+/** The middle rung, and where a spelling this gateway has no rung for lands. */
+export const DEFAULT_REASONING_EFFORT = "medium";
+
+/**
+ * Rungs from other vendors' ladders, mapped onto the nearest one here. OpenAI
+ * publishes `minimal` below `low` and `none` below that, so a client written
+ * against it sends those spellings verbatim; both mean "as little as
+ * possible", which on this ladder is `low` rather than the generic fallback.
+ */
+const REASONING_EFFORT_ALIASES = new Map([
+  ["minimal", "low"],
+  ["none", "low"],
+]);
+
 export function textPart(text: string): WirePart {
   return { type: "text", text };
 }
@@ -104,18 +118,23 @@ export function positiveMaxTokens(...candidates: unknown[]): number {
 }
 
 /**
- * Validated here rather than upstream: an unknown effort is a caller mistake
- * worth a 400 with the accepted values, not a turn billed against their plan
- * before the gateway refuses it.
+ * Normalized rather than refused. Effort is one advisory parameter on a turn
+ * the caller still wants taken, and clients send whatever their own ladder
+ * spells — `minimal`, `none`, a vendor's own word — often from a config the
+ * user never set. Failing the whole request over it turned a working client
+ * into a 400 on every turn, so an unusable spelling falls back instead.
+ *
+ * An absent effort stays absent. That is what the CLI itself puts on the wire
+ * when the user has chosen none, and it lets the gateway apply the model's own
+ * default: several models take only part of the ladder — `deepseek/deepseek-v4-*`
+ * is `high`/`max` only — so a blanket `medium` would be the wrong rung there.
  */
 export function reasoningEffort(requested: unknown): string | undefined {
   if (requested === undefined || requested === null || requested === "") return undefined;
-  if (typeof requested !== "string") throw new Error("reasoning effort must be a string");
+  if (typeof requested !== "string") return DEFAULT_REASONING_EFFORT;
 
   const effort = requested.trim().toLowerCase();
   if (!effort) return undefined;
-  if (!REASONING_EFFORTS.has(effort)) {
-    throw new Error(`reasoning effort must be one of: ${[...REASONING_EFFORTS].join(", ")}`);
-  }
-  return effort;
+  if (REASONING_EFFORTS.has(effort)) return effort;
+  return REASONING_EFFORT_ALIASES.get(effort) ?? DEFAULT_REASONING_EFFORT;
 }

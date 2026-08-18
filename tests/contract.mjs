@@ -714,18 +714,54 @@ test("command-code worker contract", { timeout: 180_000 }, async (t) => {
     assert.equal(generateCalls.at(-1).body.params.reasoning_effort, "xhigh");
   });
 
-  await t.test("rejects an unusable reasoning effort before spending a turn", async () => {
-    const before = generateCalls.length;
+  await t.test("falls back to medium rather than refusing an unusable reasoning effort", async () => {
     const response = await openai({
       model: "fixture/echo",
       messages: [{ role: "user", content: "hi" }],
       reasoning_effort: "turbo",
     });
-    assert.equal(response.status, 400);
-    const payload = await response.json();
-    assert.equal(payload.error.type, "invalid_request_error");
-    assert.match(payload.error.message, /low, medium, high, xhigh, max/);
-    assert.equal(generateCalls.length, before);
+    assert.equal(response.status, 200);
+    assert.equal(generateCalls.at(-1).body.params.reasoning_effort, "medium");
+
+    // Not a string at all — still a turn the caller asked for.
+    await openai({
+      model: "fixture/echo",
+      messages: [{ role: "user", content: "hi" }],
+      reasoning_effort: 3,
+    });
+    assert.equal(generateCalls.at(-1).body.params.reasoning_effort, "medium");
+
+    await anthropic({
+      model: "fixture/echo",
+      max_tokens: 32,
+      messages: [{ role: "user", content: "hi" }],
+      output_config: { effort: "turbo" },
+    });
+    assert.equal(generateCalls.at(-1).body.params.reasoning_effort, "medium");
+  });
+
+  await t.test("maps OpenAI's sub-low rungs onto this ladder's floor", async () => {
+    for (const requested of ["minimal", "none"]) {
+      await openai({
+        model: "fixture/echo",
+        messages: [{ role: "user", content: "hi" }],
+        reasoning_effort: requested,
+      });
+      assert.equal(generateCalls.at(-1).body.params.reasoning_effort, "low", requested);
+    }
+  });
+
+  await t.test("leaves an unrequested reasoning effort off the wire", async () => {
+    // Absent is what the CLI sends when no effort is configured, and it is the
+    // only value that works on a model taking part of the ladder.
+    for (const body of [
+      { model: "fixture/echo", messages: [{ role: "user", content: "hi" }] },
+      { model: "fixture/echo", messages: [{ role: "user", content: "hi" }], reasoning_effort: null },
+      { model: "fixture/echo", messages: [{ role: "user", content: "hi" }], reasoning_effort: "  " },
+    ]) {
+      await openai(body);
+      assert.equal("reasoning_effort" in generateCalls.at(-1).body.params, false);
+    }
   });
 
   await t.test("translates OpenAI tool history into the ModelMessage schema", async () => {

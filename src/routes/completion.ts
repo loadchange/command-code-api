@@ -73,9 +73,10 @@ export async function handleCompletion(
         ? anthropicTurn(payload as unknown as AnthropicRequest)
         : openAITurn(payload as unknown as OpenAIRequest);
   } catch (error) {
-    // Caller mistakes — an unusable reasoning effort, for instance — are worth
-    // a 400 with the accepted values rather than a turn billed against the
-    // caller's plan before the gateway refuses it.
+    // Translation repairs what it can rather than refusing it, so nothing here
+    // is expected to throw. A caller mistake that still reaches this point is
+    // worth a 400 rather than a turn billed against the caller's plan before
+    // the gateway refuses it.
     return invalidRequest(errorMessage(error), protocol);
   }
 
